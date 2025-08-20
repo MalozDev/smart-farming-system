@@ -24,8 +24,9 @@ const MqttBroker = () => {
   const [topics, setTopics] = useState([]);
   const [esp32Clients, setEsp32Clients] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [socket, setSocket] = useState(null);
 
-  // Mock ESP32 clients data
+  // Fallback mock data for development
   const mockEsp32Clients = [
     {
       id: "esp32-gps",
@@ -64,7 +65,6 @@ const MqttBroker = () => {
     },
   ];
 
-  // Mock topics data
   const mockTopics = [
     {
       name: "farm/gps/updates",
@@ -98,49 +98,154 @@ const MqttBroker = () => {
     },
   ];
 
-  // Load initial data
   useEffect(() => {
-    const simulateBrokerConnection = () => {
-      setIsLoading(true);
+    // Connect to WebSocket
+    const connectWebSocket = () => {
+      const ws = new WebSocket("ws://localhost:4000");
+      setSocket(ws);
 
-      setTimeout(() => {
-        setBrokerStatus("active");
-        setConnectionStats({
-          clients: mockEsp32Clients.filter((c) => c.status === "connected")
-            .length,
-          messages: mockTopics.reduce((sum, topic) => sum + topic.messages, 0),
-          uptime: "2h 45m",
-          cpuUsage: "32%",
-          memoryUsage: "256MB",
-        });
-
-        setTopics(mockTopics);
-        setEsp32Clients(mockEsp32Clients);
+      ws.onopen = () => {
+        console.log("Connected to gateway WebSocket");
         setIsLoading(false);
-      }, 1500);
+      };
+
+      ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+
+        switch (data.type) {
+          case "INIT":
+            setBrokerStatus(data.status.status);
+            setConnectionStats(data.status.stats);
+            setEsp32Clients(data.devices);
+            setTopics(data.topics);
+            break;
+
+          case "STATUS_UPDATE":
+            setBrokerStatus(data.status.status);
+            setConnectionStats(data.status.stats);
+            setEsp32Clients(data.devices);
+            setTopics(data.topics);
+            break;
+
+          case "MQTT_MESSAGE":
+            handleRealTimeUpdate(data.topic, data.message);
+            break;
+        }
+      };
+
+      ws.onerror = (error) => {
+        console.error("WebSocket error:", error);
+        setBrokerStatus("error");
+        // Fallback to mock data in development
+        if (process.env.NODE_ENV === "development") {
+          useMockData();
+        }
+      };
+
+      ws.onclose = () => {
+        console.log("WebSocket disconnected");
+        setBrokerStatus("disconnected");
+        // Attempt to reconnect
+        setTimeout(connectWebSocket, 5000);
+      };
+
+      return ws;
     };
 
-    simulateBrokerConnection();
+    const useMockData = () => {
+      setBrokerStatus("active");
+      setConnectionStats({
+        clients: mockEsp32Clients.filter((c) => c.status === "connected")
+          .length,
+        messages: mockTopics.reduce((sum, topic) => sum + topic.messages, 0),
+        uptime: "2h 45m",
+        cpuUsage: "32%",
+        memoryUsage: "256MB",
+      });
+      setTopics(mockTopics);
+      setEsp32Clients(mockEsp32Clients);
+      setIsLoading(false);
+    };
+
+    const ws = connectWebSocket();
 
     return () => {
-      // Cleanup if using real connection
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.close();
+      }
     };
   }, []);
 
+  const handleRealTimeUpdate = (topic, message) => {
+    try {
+      // Update specific device if this is a device topic
+      if (topic.startsWith("devices/")) {
+        const deviceId = topic.split("/")[1];
+        const messageData = JSON.parse(message);
+
+        setEsp32Clients((prevDevices) =>
+          prevDevices.map((device) =>
+            device.id === deviceId
+              ? {
+                  ...device,
+                  lastSeen: "just now",
+                  status: "connected",
+                  ...messageData,
+                }
+              : device
+          )
+        );
+      }
+
+      // Update message count
+      setConnectionStats((prev) => ({
+        ...prev,
+        messages: prev.messages + 1,
+      }));
+
+      // Update topic stats
+      setTopics((prevTopics) => {
+        const topicIndex = prevTopics.findIndex((t) => t.name === topic);
+        if (topicIndex >= 0) {
+          const updatedTopics = [...prevTopics];
+          updatedTopics[topicIndex] = {
+            ...updatedTopics[topicIndex],
+            messages: updatedTopics[topicIndex].messages + 1,
+            lastUpdated: new Date().toISOString(),
+          };
+          return updatedTopics;
+        }
+        return prevTopics;
+      });
+    } catch (error) {
+      console.error("Error processing real-time update:", error);
+    }
+  };
+
   const handleRefresh = () => {
-    setBrokerStatus("connecting");
     setIsLoading(true);
-    setTimeout(() => {
-      setBrokerStatus("active");
-      setIsLoading(false);
-    }, 1000);
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "REFRESH" }));
+    } else {
+      // Fallback if WebSocket isn't available
+      setTimeout(() => setIsLoading(false), 500);
+    }
   };
 
   const handleRestartBroker = () => {
     setBrokerStatus("restarting");
-    setTimeout(() => {
-      setBrokerStatus("active");
-    }, 3000);
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(
+        JSON.stringify({
+          type: "COMMAND",
+          data: {
+            deviceId: "broker",
+            command: "restart",
+          },
+        })
+      );
+    }
+    setTimeout(() => setBrokerStatus("active"), 3000);
   };
 
   return (
@@ -159,7 +264,8 @@ const MqttBroker = () => {
           <div className="flex space-x-2">
             <button
               onClick={handleRefresh}
-              className="flex items-center px-3 py-2 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
+              disabled={isLoading}
+              className="flex items-center px-3 py-2 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors disabled:opacity-50"
             >
               <RefreshCw
                 className={`w-4 h-4 mr-2 ${isLoading ? "animate-spin" : ""}`}
@@ -168,10 +274,11 @@ const MqttBroker = () => {
             </button>
             <button
               onClick={handleRestartBroker}
-              className="flex items-center px-3 py-2 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
+              disabled={brokerStatus === "restarting"}
+              className="flex items-center px-3 py-2 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors disabled:opacity-50"
             >
               <Power className="w-4 h-4 mr-2" />
-              Restart
+              {brokerStatus === "restarting" ? "Restarting..." : "Restart"}
             </button>
           </div>
         </div>
@@ -184,13 +291,14 @@ const MqttBroker = () => {
           <div className="flex items-center justify-between">
             <div>
               <p className="text-sm text-gray-600 mb-1">Broker Status</p>
-              <p className="text-2xl font-bold text-gray-900 capitalize">
+              <p className="text-1xl font-bold text-gray-900 capitalize">
                 {brokerStatus}
                 <span
                   className={`ml-2 inline-block w-2 h-2 rounded-full ${
                     brokerStatus === "active"
                       ? "bg-green-500"
-                      : brokerStatus === "connecting"
+                      : brokerStatus === "connecting" ||
+                        brokerStatus === "restarting"
                       ? "bg-yellow-500"
                       : "bg-red-500"
                   }`}
@@ -393,7 +501,7 @@ const MqttBroker = () => {
           </div>
           <div className="p-4 bg-gray-50 rounded-lg">
             <p className="text-sm text-gray-600 mb-1">WebSocket Port</p>
-            <p className="font-mono">ws://{window.location.hostname}:9001</p>
+            <p className="font-mono">ws://{window.location.hostname}:4000</p>
           </div>
         </div>
       </div>
